@@ -37,8 +37,19 @@ use fs::*;
 use process::*;
 use crate::fs::Stat;
 
+use crate::config::MAX_SYSCALL_NUM;
+use process::increase_task_syscall_count;
+pub use process::TaskInfo;
+
+
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
+    if syscall_id >= MAX_SYSCALL_NUM{
+        panic!("Unsupported syscall_id: {}", syscall_id);
+    }else{
+        increase_task_syscall_count(syscall_id);
+    }
+
     match syscall_id {
         SYSCALL_LINKAT => sys_linkat(args[1] as *const u8, args[3] as *const u8),
         SYSCALL_UNLINKAT => sys_unlinkat(args[1] as *const u8),

@@ -9,6 +9,8 @@ use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use lazy_static::*;
+use crate::config::BIG_STRIDE;
+
 
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
@@ -28,7 +30,18 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let (selected_index, _) = self.ready_queue.iter()
+            .enumerate()
+            .map(|(index, task)|(index, task.inner_exclusive_access().pass))
+            .min_by_key(|(_index, pass)| *pass)?;
+
+        let selected = self.ready_queue.remove(selected_index)?;
+        {
+            let mut selected_inner = selected.inner_exclusive_access();
+            let stride = BIG_STRIDE / selected_inner.priority;
+            selected_inner.pass += stride;
+        }
+        Some(selected)
     }
 }
 

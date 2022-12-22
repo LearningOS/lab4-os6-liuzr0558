@@ -13,6 +13,10 @@ use crate::fs::{File, Stdin, Stdout};
 use alloc::string::String;
 use crate::mm::translated_refmut;
 
+use crate::config::SUPPORTED_SYSCALL_NUM;
+use crate::timer::get_time_us;
+use crate::syscall::TaskInfo;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -50,6 +54,10 @@ pub struct TaskControlBlockInner {
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub syscall_times: [(usize, usize); SUPPORTED_SYSCALL_NUM],
+    pub first_run_time: Option<usize>,
+    pub priority: usize,
+    pub pass: usize,
 }
 
 /// Simple access to its internal fields
@@ -80,6 +88,22 @@ impl TaskControlBlockInner {
             self.fd_table.len() - 1
         }
     }
+
+    pub fn increase_task_syscall_count(&mut self, syscall_id: usize){
+        for (call_id, call_times) in &mut self.syscall_times{
+            if *call_id == syscall_id{
+                *call_times += 1;
+                break;
+            }else{
+                if *call_id == 0 && *call_times == 0{
+                    *call_id = syscall_id;
+                    *call_times += 1;
+                    break;
+                }
+            }
+        }
+    }
+
 }
 
 impl TaskControlBlock {
@@ -124,6 +148,10 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    syscall_times: [(0,0); SUPPORTED_SYSCALL_NUM],
+                    first_run_time: None,
+                    priority: 16,
+                    pass: 0,
                 })
             },
         };
@@ -200,6 +228,10 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    syscall_times: parent_inner.syscall_times,
+                    first_run_time: parent_inner.first_run_time,
+                    priority: parent_inner.priority,
+                    pass: parent_inner.pass,
                 })
             },
         });
@@ -214,9 +246,85 @@ impl TaskControlBlock {
         // ---- release parent PCB automatically
         // **** release children PCB automatically
     }
+
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let mut parent_inner = self.inner_exclusive_access();
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = KernelStack::new(&pid_handle);
+        let kernel_stack_top = kernel_stack.get_top();
+        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+
+        for fd in parent_inner.fd_table.iter() {
+            if let Some(file) = fd {
+                new_fd_table.push(Some(file.clone()));
+            } else {
+                new_fd_table.push(None);
+            }
+        }
+
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: new_fd_table,
+                    syscall_times: parent_inner.syscall_times,
+                    first_run_time: parent_inner.first_run_time,
+                    priority: parent_inner.priority,
+                    pass: parent_inner.pass,
+                })
+            },
+        });
+
+        parent_inner.children.push(task_control_block.clone());
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
+    }
+
     pub fn getpid(&self) -> usize {
         self.pid.0
     }
+
+    pub fn get_task_task_info(&self) -> TaskInfo{
+        let inner = &self.inner.exclusive_access();
+        let current_time = get_time_us();
+        let start_time = inner.first_run_time
+            .expect("Why task is running but start time is None!");
+
+        let mut syscall_times = [0u32; 500];
+
+        for (call_id, call_times) in inner.syscall_times{
+            syscall_times[call_id] = call_times as u32;
+        }
+
+        TaskInfo{
+            status: inner.task_status,
+            syscall_times,
+            time: (current_time - start_time) / 1000,
+        }
+    }
+
 }
 
 #[derive(Copy, Clone, PartialEq)]

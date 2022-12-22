@@ -11,6 +11,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::config::MAX_SYSCALL_NUM;
 use alloc::string::String;
+use crate::task::{TaskControlBlock};
+use core::mem::size_of;
+use crate::mm::kernel_copy_to_user;
+use crate::mm::{VirtAddr, MapPermission, VPNRange, MapType, MapArea};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -110,39 +114,162 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 }
 
 // YOUR JOB: 引入虚地址后重写 sys_get_time
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    let _us = get_time_us();
-    // unsafe {
-    //     *ts = TimeVal {
-    //         sec: us / 1_000_000,
-    //         usec: us % 1_000_000,
-    //     };
-    // }
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let us = get_time_us();
+    let tm = TimeVal{
+        sec: us / 1_000_000,
+        usec: us % 1_000_000
+    };
+
+    let tm_ptr = unsafe{
+        core::mem::transmute::<&TimeVal, *const u8>(&tm)
+    };
+
+    let ts_ptr = unsafe{core::mem::transmute::<*mut TimeVal, *mut u8>(ts)};
+
+    kernel_copy_to_user(tm_ptr, current_user_token(), ts_ptr, size_of::<TimeVal>());
     0
 }
 
+
 // YOUR JOB: 引入虚地址后重写 sys_task_info
 pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
-    -1
+    let task_info = task_info_in_current();
+
+    let task_info_ptr = unsafe{
+        core::mem::transmute::<&TaskInfo, *const u8>(&task_info)
+    };
+
+    let ti_ptr = unsafe{
+        core::mem::transmute::<*mut TaskInfo, *mut u8>(ti)
+    };
+
+    kernel_copy_to_user(task_info_ptr, current_user_token(), ti_ptr, size_of::<TaskInfo>());
+    0
+}
+
+pub fn task_info_in_current() -> TaskInfo{
+    let current = current_task().unwrap();
+    current.get_task_task_info()
 }
 
 // YOUR JOB: 实现sys_set_priority，为任务添加优先级
-pub fn sys_set_priority(_prio: isize) -> isize {
-    -1
+pub fn sys_set_priority(prio: isize) -> isize {
+    let prio = if prio < 2{
+        return -1;
+    }else{
+        prio as usize
+    };
+
+    let current = current_task().unwrap();
+    let mut current_inner = current.inner_exclusive_access();
+    current_inner.priority = prio;
+    prio as isize
 }
 
 // YOUR JOB: 扩展内核以实现 sys_mmap 和 sys_munmap
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    -1
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    let v_start = VirtAddr::from(start);
+
+    if !v_start.aligned(){
+        return -1;
+    }
+
+    if (port & !0x7 != 0) || (port &0x7 == 0){
+        return -1;
+    }
+
+    let mut map_permit = MapPermission::empty();
+    map_permit |= MapPermission::U;
+
+    if (port & 0x01) != 0{
+        map_permit |= MapPermission::R;
+    }
+
+    if (port & 0x02) != 0{
+        map_permit |= MapPermission::W;
+    }
+
+    if (port & 0x04) != 0{
+        map_permit |= MapPermission::X;
+    }
+
+    let v_end = VirtAddr::from(start + len);
+    let vpn_start = v_start.floor();
+    let vpn_end = v_end.ceil();
+    let map_range = VPNRange::new(vpn_start, vpn_end);
+
+    if any_vpn_mapped_in_current(map_range){
+        return -1;
+    }
+
+    map_in_current(v_start, v_end, map_permit);
+    0
 }
 
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    -1
+pub fn any_vpn_mapped_in_current(vpn_range: VPNRange) -> bool{
+    let current = current_task().unwrap();
+    let current_inner = current.inner_exclusive_access();
+    current_inner.memory_set.any_vpn_mapped(vpn_range)
+}
+
+pub fn map_in_current(va_start: VirtAddr, va_end: VirtAddr, permit: MapPermission){
+    let current = current_task().unwrap();
+    let mut current_inner = current.inner_exclusive_access();
+    current_inner.memory_set.push(MapArea::new(va_start, va_end, MapType::Framed, permit), None)
+}
+
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    let start_va = VirtAddr::from(start);
+
+    if !start_va.aligned(){
+        return -1;
+    }
+
+    let start_vpn = start_va.floor();
+    let end_va = VirtAddr::from(start + len);
+    let end_vpn = end_va.ceil();
+
+    if !all_vpn_mapped_in_current(VPNRange::new(start_vpn, end_vpn)){
+        return -1;
+    }
+
+    unmap_in_current(VPNRange::new(start_vpn, end_vpn));
+    0
+}
+
+pub fn all_vpn_mapped_in_current(vpn_range: VPNRange) -> bool{
+    let current = current_task().unwrap();
+    let current_inner = current.inner_exclusive_access();
+    current_inner.memory_set.all_vpn_mapped(vpn_range)
+}
+
+pub fn unmap_in_current(vpn_range: VPNRange){
+    let current = current_task().unwrap();
+    let mut current_inner = current.inner_exclusive_access();
+    current_inner.memory_set.pop(vpn_range);
 }
 
 //
 // YOUR JOB: 实现 sys_spawn 系统调用
 // ALERT: 注意在实现 SPAWN 时不需要复制父进程地址空间，SPAWN != FORK + EXEC 
-pub fn sys_spawn(_path: *const u8) -> isize {
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let current_task = current_task().unwrap();
+        let new_task = current_task.spawn(data);
+        let new_pid = new_task.pid.0;
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
+}
+
+pub fn increase_task_syscall_count(syscall_id: usize){
+    let current = current_task().unwrap();
+    let mut current_inner = current.inner_exclusive_access();
+    current_inner.increase_task_syscall_count(syscall_id);
 }

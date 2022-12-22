@@ -258,3 +258,17 @@ impl Iterator for UserBufferIterator {
         }
     }
 }
+
+pub fn kernel_copy_to_user(k_ptr: *const u8, u_token: usize, u_ptr: *mut u8, len: usize){
+    let u_buffers = translated_byte_buffer(u_token, u_ptr, len);
+    let mut len = 0 as usize;
+
+    for buffer in u_buffers{
+        unsafe{
+            core::ptr::copy(k_ptr.add(len), buffer.as_mut_ptr(), buffer.len());
+        }
+
+        len += buffer.len();
+    }
+}
+
