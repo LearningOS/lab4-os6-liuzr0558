@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 use core::cell::RefMut;
 use crate::fs::{File, Stdin, Stdout};
 use alloc::string::String;
+use alloc::vec;
 use crate::mm::translated_refmut;
 
-use crate::config::SUPPORTED_SYSCALL_NUM;
 use crate::timer::get_time_us;
 use crate::syscall::TaskInfo;
 
@@ -54,7 +54,7 @@ pub struct TaskControlBlockInner {
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
-    pub syscall_times: [(usize, usize); SUPPORTED_SYSCALL_NUM],
+    pub syscall_times: Vec<(usize, usize)>,
     pub first_run_time: Option<usize>,
     pub priority: usize,
     pub pass: usize,
@@ -93,15 +93,11 @@ impl TaskControlBlockInner {
         for (call_id, call_times) in &mut self.syscall_times{
             if *call_id == syscall_id{
                 *call_times += 1;
-                break;
-            }else{
-                if *call_id == 0 && *call_times == 0{
-                    *call_id = syscall_id;
-                    *call_times += 1;
-                    break;
-                }
+                return;
             }
         }
+
+        self.syscall_times.push((syscall_id, 1));
     }
 
 }
@@ -148,7 +144,7 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
-                    syscall_times: [(0,0); SUPPORTED_SYSCALL_NUM],
+                    syscall_times: vec![],
                     first_run_time: None,
                     priority: 16,
                     pass: 0,
@@ -228,7 +224,7 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
-                    syscall_times: parent_inner.syscall_times,
+                    syscall_times: parent_inner.syscall_times.clone(),
                     first_run_time: parent_inner.first_run_time,
                     priority: parent_inner.priority,
                     pass: parent_inner.pass,
@@ -282,7 +278,7 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
-                    syscall_times: parent_inner.syscall_times,
+                    syscall_times: parent_inner.syscall_times.clone(),
                     first_run_time: parent_inner.first_run_time,
                     priority: parent_inner.priority,
                     pass: parent_inner.pass,
@@ -312,17 +308,17 @@ impl TaskControlBlock {
         let start_time = inner.first_run_time
             .expect("Why task is running but start time is None!");
 
-        let mut syscall_times = [0u32; 500];
-
-        for (call_id, call_times) in inner.syscall_times{
-            syscall_times[call_id] = call_times as u32;
-        }
-
-        TaskInfo{
+        let mut task_info = TaskInfo{
             status: inner.task_status,
-            syscall_times,
+            syscall_times: [0u32; 500],
             time: (current_time - start_time) / 1000,
+        };
+
+        for (call_id, call_times) in &inner.syscall_times{
+            task_info.syscall_times[*call_id] = *call_times as u32;
         }
+
+        task_info
     }
 
 }

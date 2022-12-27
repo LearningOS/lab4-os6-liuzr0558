@@ -5,12 +5,13 @@ use super::{
     get_block_cache,
 };
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Magic number for sanity check
 const EFS_MAGIC: u32 = 0x3b800001;
 /// The max number of direct inodes
-const INODE_DIRECT_COUNT: usize = 28;
+const INODE_DIRECT_COUNT: usize = 27;
 /// The max length of inode name
 const NAME_LENGTH_LIMIT: usize = 27;
 /// The max number of indirect1 inodes
@@ -74,7 +75,7 @@ impl SuperBlock {
 }
 
 /// Type of a disk inode
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum DiskInodeType {
     File,
     Directory,
@@ -89,6 +90,7 @@ type DataBlock = [u8; BLOCK_SZ];
 #[repr(C)]
 pub struct DiskInode {
     pub size: u32,
+    pub nlink: u32,
     pub direct: [u32; INODE_DIRECT_COUNT],
     pub indirect1: u32,
     pub indirect2: u32,
@@ -100,6 +102,7 @@ impl DiskInode {
     /// indirect1 and indirect2 block are allocated only when they are needed
     pub fn initialize(&mut self, type_: DiskInodeType) {
         self.size = 0;
+        self.nlink = 1;
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
@@ -343,6 +346,111 @@ impl DiskInode {
         self.indirect2 = 0;
         v
     }
+
+    pub fn decrease_blocks(&mut self, start_size: usize, block_device: &Arc<dyn BlockDevice>) -> Vec<u32> {
+        let mut v: Vec<u32> = Vec::new();
+        let start_blocks = Self::total_blocks(start_size as u32);
+        let mut start_block = if start_blocks > 0 {
+            start_blocks as usize
+        }else{
+            0
+        };
+
+        let mut data_blocks = self.data_blocks() as usize;
+
+        // direct
+        while start_block < data_blocks.min(INODE_DIRECT_COUNT) {
+            v.push(self.direct[start_block]);
+            self.direct[start_block] = 0;
+            start_block += 1;
+        }
+
+        if data_blocks <= INODE_DIRECT_COUNT{
+            return v;
+        }
+
+        let indirect1 = self.indirect1;
+
+        if start_block == INODE_DIRECT_COUNT{
+            v.push(self.indirect1);
+            self.indirect1 = 0;
+        }
+
+        get_block_cache(
+            indirect1 as usize,
+            Arc::clone(block_device),
+        )
+            .lock()
+            .modify(0, |indirect1: &mut IndirectBlock| {
+                while start_block < data_blocks.min(INODE_INDIRECT1_COUNT + INODE_DIRECT_COUNT) {
+                    v.push(indirect1[start_block - INODE_DIRECT_COUNT]);
+                    //indirect1[current_blocks] = 0;
+                    start_block += 1;
+                }
+            });
+
+
+        if data_blocks <= INODE_DIRECT_COUNT + INODE_INDIRECT1_COUNT{
+            return v;
+        }
+
+        let indirect2 = self.indirect2;
+
+        if start_block == INODE_DIRECT_COUNT + INODE_INDIRECT1_COUNT{
+            v.push(self.indirect2);
+            self.indirect2 = 0;
+        }
+
+        let a1 = (data_blocks - (INODE_DIRECT_COUNT + INODE_INDIRECT1_COUNT)) / INODE_INDIRECT1_COUNT;
+        let b1 = (data_blocks - (INODE_DIRECT_COUNT + INODE_INDIRECT1_COUNT)) % INODE_INDIRECT1_COUNT;
+        get_block_cache(
+            indirect2 as usize,
+            Arc::clone(block_device),
+        )
+            .lock()
+            .modify(0, |indirect2: &mut IndirectBlock| {
+                // full indirect1 blocks
+                for i in 0..a1 {
+                    if start_block == (INODE_DIRECT_COUNT + INODE_INDIRECT1_COUNT) + i * INODE_INDIRECT1_COUNT{
+                        v.push(indirect2[i]);
+                    }
+
+                    get_block_cache(
+                        indirect2[i] as usize,
+                        Arc::clone(block_device),
+                    )
+                        .lock()
+                        .modify(0, |indirect1: &mut IndirectBlock| {
+                            for j in 0..INODE_INDIRECT1_COUNT {
+                                v.push(indirect1[j]);
+                                start_block += 1;
+                            }
+                        });
+                    //indirect2[i] = 0;
+                }
+                // last indirect1 block
+                if b1 > 0 {
+                    if start_block == (INODE_DIRECT_COUNT + INODE_INDIRECT1_COUNT) + a1 * INODE_INDIRECT1_COUNT{
+                        v.push(indirect2[a1]);
+                    }
+
+                    get_block_cache(
+                        indirect2[a1] as usize,
+                        Arc::clone(block_device),
+                    )
+                        .lock()
+                        .modify(0, |indirect1: &mut IndirectBlock| {
+                            for j in 0..b1 {
+                                v.push(indirect1[j]);
+                                start_block += 1;
+                            }
+                        });
+                }
+            });
+
+        v
+    }
+
     /// Read data from current disk inode
     pub fn read_at(
         &self,

@@ -1,6 +1,7 @@
 #![no_std]
 
 extern crate alloc;
+extern crate log;
 
 mod block_dev;
 mod layout;
@@ -17,3 +18,4 @@ pub use vfs::Inode;
 use layout::*;
 use bitmap::Bitmap;
 use block_cache::{get_block_cache, block_cache_sync_all};
+pub use layout::DiskInodeType;

@@ -1,7 +1,4 @@
-use easy_fs::{
-    EasyFileSystem,
-    Inode,
-};
+use easy_fs::{DiskInodeType, EasyFileSystem, Inode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
@@ -10,6 +7,7 @@ use bitflags::*;
 use alloc::vec::Vec;
 use super::File;
 use crate::mm::UserBuffer;
+use crate::fs::{Stat, StatMode};
 
 /// A wrapper around a filesystem inode
 /// to implement File trait atop
@@ -139,6 +137,14 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+pub fn link_file(old_path: &str, new_path: &str) -> isize{
+    ROOT_INODE.link(old_path, new_path)
+}
+
+pub fn unlink_file(name: &str) -> isize{
+    ROOT_INODE.unlink(name)
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool { self.readable }
     fn writable(&self) -> bool { self.writable }
@@ -165,5 +171,26 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+
+    fn stat(&self) -> Result<Stat, isize>{
+        let inode = &self.inner.exclusive_access().inode;
+        let (dev, ino, inode_type, link_count) = match inode.stat(){
+            Ok(stat) => stat,
+            Err(e) => return Err(e),
+        };
+
+        let mode = match inode_type {
+            DiskInodeType::File => StatMode::FILE,
+            DiskInodeType::Directory => StatMode::DIR,
+        };
+
+        Ok(Stat{
+            dev,
+            ino: ino as u64,
+            mode,
+            nlink: link_count,
+            pad: [0; 7],
+        })
     }
 }
